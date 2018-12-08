@@ -1,0 +1,505 @@
+---
+title: "Appendix"
+author: "Mirza S. Khan"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE, message=FALSE, fig.path='figures/', dev=c('png'))
+```
+
+```{r, message=FALSE, warning=FALSE}
+library(GEOquery)
+library(limma)
+library(minfi)
+library(minfiData)
+library(missMethyl)
+library(RColorBrewer)
+library(genefilter)
+library(dplyr)
+library(stringr)
+library(forcats)
+library(ggplot2)
+library(MEAL)
+library(ChAMP)
+library(kableExtra)
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+# Import data from GEO onto my system
+melanoma_set <- getGenomicRatioSetFromGEO(GSE = "GSE44661", path = ".")
+
+#melanoma_set
+
+# The `GenomicRatioSet` object provides us with the methylation array data that is mapped to the "genomic coordinates."
+
+# The RGChannelSet has already been processed and is available as a GenomicRatioSet, i.e. conversion of red and green
+# intensities to final beta values, M values, copy number estimates and genomic locations has been performed.
+
+# The data was extracted to Bioconductor using the `methylumi` package by the experimenters.
+
+```
+
+```{r}
+# Clean up sample names
+sampleNames(melanoma_set) <- sampleNames(melanoma_set) %>% str_replace("^Genomic DNA from ", "")
+
+```
+
+```{r}
+# Select only those features of interest for analysis
+#head(pData(melanoma_set)) # see all features
+
+columns_interest <- c("title", "geo_accession", "source_name_ch1", "characteristics_ch1.2", "disease:ch1", "tissue:ch1")
+
+pD <- pData(melanoma_set)[, columns_interest]
+#head(pD) # verify all features of interest available
+
+# Rename features of interest for ease and comprehension
+names(pD)[4:6] <- c("clinical_stage", "disease", "tissue")
+
+pD$clinical_stage <- sub("^clinical stage: ", "", pD$clinical_stage)
+pD$clinical_stage <- dplyr::na_if(pD$clinical_stage, "")
+pD$disease <- tidyr::replace_na(data = pD$disease, "normal")
+
+#head(pD, 1) #verify changes
+
+# Now that changes to phenotypic data complete, apply to our main dataset
+pData(melanoma_set) <- pD
+```
+
+```{r}
+# Extract data to callable objects
+
+beta_values <- getBeta(melanoma_set)
+M_values <- getM(melanoma_set) #not going to use M-values
+CN_values <- getCN(melanoma_set)
+sample_names <- sampleNames(melanoma_set)
+probe_names <- featureNames(melanoma_set)
+pheno <- pData(melanoma_set)
+```
+
+```{r}
+# View SNPs
+
+#SNPs <- getSnpInfo(melanoma_set)
+#head(SNPs, 10)
+
+#`rs` is the name of the SNP and `maf` is the minor allele frequency of the SNPs based on the dbSNP database
+```
+
+```{r}
+# Exclusion
+
+### Drop SNPs
+
+# Remove probes with SNPs
+melanoma_set  <- dropLociWithSnps(melanoma_set, snps = c("CpG", "SBE"), maf = 0)
+
+# Remove probes measuring SNPs
+melanoma_set  <- dropMethylationLoci(melanoma_set)
+
+
+### Drop NA probes
+
+# How many NA probes?
+#sum( is.na(beta_values) ) - 28,939 probes
+
+# Drop 'em
+melanoma_set <- melanoma_set[!apply(getBeta(melanoma_set), 1, function(x) any(is.na(x))), ]
+```
+
+```{r}
+#Run MEAL pipeline
+
+library(MEAL)
+
+# MEAL takes a GenomicRatioSet object and runs it thru the pipeline
+# Default bumphunter cutoff is 0.1
+res <- runPipeline(set = melanoma_set, variable_names = "disease", bumphunter_params = c(bumphunter_cutoff = 0.3)) # I used 100 permutations vs default and got the same number, so I dropped the bootstrap to save time for re-analysis
+```
+
+# Quality Control
+
+```{r}
+# Distribution of Beta values
+
+densityPlot(beta_values, sampGroups=melanoma_set$tissue, main="Beta values", 
+            legend=FALSE, xlab="Beta values")
+legend("top", legend = levels(factor(melanoma_set$tissue)), 
+       text.col=brewer.pal(8,"Dark2"))
+```
+
+```{r}
+# Disribution of M values
+
+densityPlot(M_values, sampGroups=melanoma_set$tissue, main="M values", 
+            legend=FALSE, xlab="M values")
+legend("topleft", legend = levels(factor(melanoma_set$tissue)), 
+       text.col=brewer.pal(8,"Dark2"), box.lty=0, bg="transparent",
+       cex = 0.8)
+```
+
+
+
+# Dimensionality Reduction
+
+## PCA
+
+```{r}
+###### EDA ##########
+
+#PCA, unsupervised method to evaluate similarities/differences between the samples. Similar will cluster together
+## using `plotMDS` from `limma`
+
+pal <- brewer.pal(5, "Set2")
+
+plotMDS(beta_values, top=2500, gene.selection="common", 
+        col=pal[factor(pheno$disease)], main="PCA - normal vs melanoma")
+legend("topleft", legend=levels(factor(pheno$disease)), text.col=pal,
+       bg="white", cex=0.7)
+
+# For the nml vs melanoma, I used "common" for gene.selection, uses top genes w/largest std deviation
+```
+
+```{r}
+# PCA - compare nml, primary, mets (LN, brain)
+## performed "pairwise" to select diff genes to compare for each pairing
+
+plotMDS(beta_values, top=2500, gene.selection="pairwise", 
+        col=pal[factor(pheno$tissue)], main = "PCA by tissue type")
+legend("topleft", legend=levels(factor(pheno$tissue)), text.col=pal,
+       bg="white", cex=0.7)
+```
+
+## RDA
+
+
+```{r}
+#Does phenotype cause ∆ in methylation means?
+
+targetRange <- GRanges("chr6:31000000-33000000") # assessed on 31Mb-33Mb on Chr 6
+resRDA <- runRDA(set = melanoma_set, model = ~ disease, range = targetRange)
+
+getAssociation(resRDA, rid = "RDA")
+
+# relies on the `vegan` package
+#getRDAresults(resRDA)
+
+#topRDAhits(resRDA)
+
+plotRDA(object = resRDA, pheno = colData(melanoma_set)[, "tissue", drop = FALSE])
+```
+
+
+# Differential Methylation Analysis
+
+## Differentially Methylated Positions (DMPs)
+
+```{r}
+# tests each genomic position for association between methylation and a phenotype
+
+#tissue_type <- pheno$disease # phenotype as Melanocyte vs Melanoma
+
+#dmp <- dmpFinder(beta_values, pheno = tissue_type, type = "categorical")
+
+#sum(dmp$qval < 0.05, na.rm=TRUE) # 5,351 DMPs w/ qval < 0.05
+#head(dmp) # includes results of F-stat at the probe level
+```
+
+```{r}
+# Alternative approach using lmFit, eBayes
+designMatrix <- model.matrix(~ pheno$disease)
+#head(designMatrix)
+
+
+fit <- lmFit(beta_values, designMatrix) # fit linear model
+fit <- eBayes(fit) # perform empirical Bayes method to shrink the probe-wise sample variances towards a common value
+
+summary(decideTests(fit)) # shows how many CpGs are hyper- or hypomethylated ## thus, I want to select `coef=2`
+
+topCpGs <- topTable(fit,coef=2, adjust.method = "BH") # gives table of top-ranked genes, uses Benjamini-Hochberg for p-val correction to control FDR
+
+all_sigCpGs <- topTable(fit, num=Inf, coef=2, adjust.method = "BH") # Use this for pathway analysis
+
+topCpGs[,4:5] <- format(topCpGs[,4:5], digits = 3)
+
+kable(topCpGs, booktabs=T) %>% 
+  kable_styling(latex_options = "striped")
+
+# logFC - estimate of the log2-fold-change corresponding to the effect
+# AveExpr - average log2-expression for the probe over all arrays and channels
+# t - moderated t-stat
+# P-val, BH adjusted P-val
+# B is log-odds that a gene is differentially expressed
+```
+
+```{r}
+# plot the top 4 most significantly differentially methylated CpGs 
+par(mfrow=c(2,2))
+purrr::walk(rownames(topCpGs)[1:4], function(cpg){
+  plotCpg(beta_values, cpg=cpg, pheno=pheno$disease, ylab = "Beta values")
+})
+```
+
+```{r}
+# Where are the significant ∆ in methylation located?
+
+#targetRange <- GRanges("6:28000000-33000000")
+#plot(res, rid = "DiffMean", type = "manhattan", highlight = targetRange)
+plot(res, rid = "DiffMean", type = "manhattan")
+```
+
+```{r}
+# threshold for p-value 20
+plot(res, rid = "DiffMean", type = "volcano", tPV = 20, tFC = 0.4, 
+     show.labels = TRUE) + ggtitle("Volcano Plot of Difference in Methylation - Normal vs Melanoma")
+```
+
+
+```{r}
+# vis_a <- plotFeature(set = melanoma_set, feat = "cg06654604", variables = "tissue") + 
+#   ggtitle("Methylation Difference for cg06654604") +
+#   theme_bw() +
+#   theme(axis.text.x = element_text(angle = 15, hjust = 1, vjust = 0.5))
+# 
+# vis_b <- plotFeature(set = melanoma_set, feat = "cg01015662", variables = "tissue") + 
+#   ggtitle("Methylation Difference for cg01015662") +
+#   theme_bw() +
+#   theme(axis.text.x = element_text(angle = 15, hjust = 1, vjust = 0.5))
+# 
+# vis_c <- plotFeature(set = melanoma_set, feat = "cg08282819", variables = "tissue") + 
+#   ggtitle("Methylation Difference for cg08282819") +
+#   theme_bw() +
+#   theme(axis.text.x = element_text(angle = 15, hjust = 1, vjust = 0.5))
+# 
+# prow <- cowplot::plot_grid( vis_a + theme(legend.position="none"),
+#            vis_b + theme(legend.position="none"),
+#            vis_c + theme(legend.position="none"),
+#            align = 'vh',
+#            labels = c("A", "B", "C"),
+#            hjust = -1,
+#            nrow = 1
+#            )
+# prow
+# 
+# legend <- cowplot::get_legend(vis_a + theme(legend.position="bottom"))
+# 
+# p <- 
+# p
+# 
+# ggpubr::ggarrange(vis_a + theme(legend.position="none"), 
+#                   vis_b + theme(legend.position="none"),
+#                   vis_c + theme(legend.position="none"),
+#                   labels = c("A", "B", "C"),
+#                   hjust = -1,
+#                   nrow = 2, ncol = 2)
+```
+
+
+```{r}
+plotFeature(set = melanoma_set, feat = "cg06654604", variables = "tissue") + 
+  ggtitle("Methylation Difference for cg06654604") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1, vjust = 0.5))
+```
+
+```{r}
+plotFeature(set = melanoma_set, feat = "cg01015662", variables = "tissue") + 
+  ggtitle("Methylation Difference for cg01015662") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1, vjust = 0.5))
+```
+
+```{r}
+plotFeature(set = melanoma_set, feat = "cg08282819", variables = "tissue") + 
+  ggtitle("Methylation Difference for cg08282819") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1, vjust = 0.5))
+```
+
+
+```{r}
+CpG.GUI(CpG = rownames(beta_values), arraytype = "450K")
+```
+
+
+```{r}
+myDMP <- champ.DMP(beta = beta_values, pheno = pheno$disease)
+
+DMP.GUI(DMP = myDMP[[1]], beta = beta_values, pheno = pheno$disease)
+```
+
+```{r}
+
+```
+
+
+```{r}
+# Test for diff b/w group variances
+tissue_design <- model.matrix(~ pheno$tissue)
+fitvar <- varFit(getBeta(melanoma_set), tissue_design, coef = 2)
+
+# How many genes have hyper- or hypovariable methylation?
+summary(decideTests(fitvar))
+
+
+# What probes have the greatest variation (up/down)?
+topDV <- topVar(fitvar, coef=2)
+topDV
+```
+
+
+```{r}
+# Beta-values for top 4 most variable CpGs
+par(mfrow=c(2,2))
+purrr::walk(rownames(topDV)[1:4], function(cpg){
+  plotCpg(beta_values, cpg=cpg, pheno=pheno$tissue, ylab = "Beta values")
+})
+```
+
+
+
+## Differentially Methylated Regions (DMRs)
+
+```{r}
+#How many DMRs using bumphunter vs DMRcate?
+
+#nrow(getAssociation(res, rid = "bumphunter")) # 25,716 bumps w/ default settings, using cutoff 0.3
+
+#nrow(getAssociation(res, rid = "dmrcate")) # 238 DMRs
+```
+
+
+### Bumphunter
+
+[Nice tutorial](https://www.bioconductor.org/help/course-materials/2014/BioC2014/minfi_BioC2014.pdf)
+
+```{r}
+# bumphunter - fits a linear model (like limma's lmFit), can use permutation to assess for uncertainty
+# Step 1: defines clusters of probes w/in `maxGap`
+# Step 2: computes t-stat at each genomic location (+/- smoothing)
+# Step 3: region can be a candidate if > p-val threshold
+# +/- Step 4: change B = 0 to some # of permutations
+
+# Parallelize
+# library(doParallel)
+# registerDoParallel(cores = 2)
+# 
+# tissue_type <- pheno$disease
+# designMatrix <- model.matrix(~ tissue_type)
+# 
+# # adjust cutoff of Beta-values to get < 30k bumps
+# # will not do permutations b/c computationally expensive
+# dmr <- bumphunter(melanoma_set, design = designMatrix, cutoff = 0.3, B = 0, type = "Beta") # cutoff (mean diff in Beta-values) of 0.3 gave 25k bumps
+```
+
+```{r}
+# dmr$table %>%
+#   filter(chr == "chr19") %>%
+#   head()
+```
+
+```{r}
+topBumps <- getAssociation(res, rid = "bumphunter")[1:15,] # gives top 15 bumps
+
+kable(topBumps, booktabs=T) %>% 
+  kable_styling(latex_options = "striped")
+```
+
+
+### DMRcate
+
+Interpretation of results (Source)[https://www.bioconductor.org/packages/release/bioc/manuals/DMRcate/man/DMRcate.pdf]:
+
+- `coord`: the coordinates of the significant region in hg19
+- `no.cpgs`: number of CpG sites constituting the significant region
+- `minfdr`: minimum _adjusted_ p-value from the CpGs constituting the significant region.
+- `Stouffer`: Stouffer transformation of the group of limma- or DSS-derived fdrs for individual
+CpG sites as DMR constituents
+- `maxbetafc`: maximum absolute beta fold change within the region
+- `meanbetafc`: mean beta fold change within the region
+
+[Tutorial](https://bioconductor.org/packages/release/bioc/vignettes/DMRcate/inst/doc/DMRcate.pdf)
+
+```{r, message=FALSE, warning=FALSE}
+#DMRcate
+
+# myannotation <- cpg.annotate("array", melanoma_set, "Beta", "450K", analysis.type = "differential", design = designMatrix,
+#              contrasts = FALSE, fdr = 0.05, coef = 2)
+# 
+# dmrcate_results <- dmrcate(myannotation, lambda=1000, C=2)
+# 
+# DMRC_ranges <- extractRanges(dmrcate_results, genome = "hg19")
+# 
+# # DMRs in Chromosome 6
+# DMRC_ranges[seqnames(DMRC_ranges) == "chr6"]
+# 
+# # View range info only
+# ranges(DMRC_ranges[seqnames(DMRC_ranges) == "chr6"])
+```
+
+```{r}
+topDMRC <- getAssociation(res, rid = "dmrcate")[1:15,]
+
+kable(topDMRC, booktabs=T) %>% 
+  kable_styling(latex_options = "striped")
+```
+
+## Plot DMRs
+
+```{r}
+# targetRange <- GRanges("chr6:31650735-31651362")
+# MEAL::plotRegion(res, targetRange)
+
+targetRange <- GRanges("chr6:31500000-31700000")
+MEAL::plotRegion(res, targetRange, tPV = 10)
+```
+
+
+# Pathway Analysis
+
+
+```{r}
+# topTable by default gives top 10
+topCpGs <- topTable(fit,coef=2)
+sigCpGs <- rownames(topCpGs)
+sigCpGs
+```
+
+```{r}
+gst <- gometh(sig.cpg=sigCpGs, all.cpg=rownames(melanoma_set), collection="GO")
+
+#topGO(gst)
+```
+
+```{r}
+topGO(gst)
+```
+
+- N: number of genes in the GO or KEGG term
+- DE: number of genes that are differentially methylated
+- P.DE: p-value for over-representation of the GO or KEGG term term
+- FDR: False discovery rate
+
+```{r}
+gst_kegg <- gometh(sig.cpg=sigCpGs, all.cpg=rownames(melanoma_set), collection="KEGG")
+```
+
+```{r}
+topKEGG(gst_kegg)
+```
+
+
+
+```{r}
+# Network analysis
+
+# uses FEM package
+#  generate protein interaction network - based on differential  promoter  methylation  and  differential  expression, where an inverse association between promoter methylation and gene expression is assumed
+# myEpiMod <- champ.EpiMod(beta = beta_values, pheno = pheno$disease) - almost crashed my laptop. Maybe w/ more computer power and memory
+```
+
